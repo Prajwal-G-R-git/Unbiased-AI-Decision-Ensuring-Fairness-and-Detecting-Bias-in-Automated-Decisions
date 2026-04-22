@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import io
 import json
+import numpy as np
 
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
@@ -23,6 +24,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- HELPER FUNCTION ---
+def get_model(model_type):
+    if model_type == 'logistic_regression':
+        return LogisticRegression(max_iter=1000, random_state=42)
+    return DecisionTreeClassifier(random_state=42)
+
+
+# ==========================================
+# CHUNK 1: DATA ANALYSIS ENDPOINT
+# ==========================================
 @app.post("/api/v1/analyze")
 async def analyze_data(
     file: UploadFile = File(...),
@@ -98,7 +109,7 @@ async def analyze_data(
                     "message": f"Sensitive attribute '{col}' has a highly underrepresented group ({min_group_prop:.1%})."
                 })
 
-        response = {
+        return {
             "dataset_summary": {
                 "total_rows": total_rows,
                 "total_columns": len(df.columns),
@@ -120,13 +131,14 @@ async def analyze_data(
             },
             "warnings": warnings
         }
-        
-        return response
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==========================================
+# CHUNK 2 & 3: MODEL TRAINING ENDPOINT
+# ==========================================
 @app.post("/api/v1/train")
 async def train_model(
     file: UploadFile = File(...),
@@ -157,13 +169,7 @@ async def train_model(
             X, y, A, test_size=0.2, random_state=42, stratify=y
         )
         
-        if model_type == 'logistic_regression':
-            model = LogisticRegression(max_iter=1000, random_state=42)
-        elif model_type == 'decision_tree':
-            model = DecisionTreeClassifier(random_state=42)
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported model type.")
-            
+        model = get_model(model_type)
         model.fit(X_train, y_train)
         
         y_pred = model.predict(X_test)
@@ -193,77 +199,9 @@ async def train_model(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/v1/mitigate")
-async def mitigate_bias(
-    file: UploadFile = File(...),
-    target_column: str = Form(...),
-    sensitive_attribute: str = Form(...), 
-    model_type: str = Form(...) 
-):
-    try:
-        contents = await file.read()
-        if file.filename.endswith('.csv'):
-            df = pd.read_csv(io.BytesIO(contents))
-        else:
-            df = pd.read_excel(io.BytesIO(contents))
-            
-        df = df.dropna()
-        
-        A = df[sensitive_attribute]
-        
-        le = LabelEncoder()
-        df[target_column] = le.fit_transform(df[target_column])
-        
-        features_to_encode = df.drop(columns=[target_column, sensitive_attribute])
-        X = pd.get_dummies(features_to_encode)
-        y = df[target_column]
-        
-        X_train, X_test, y_train, y_test, A_train, A_test = train_test_split(
-            X, y, A, test_size=0.2, random_state=42, stratify=y
-        )
-        
-        if model_type == 'logistic_regression':
-            base_model = LogisticRegression(max_iter=1000, random_state=42)
-        else:
-            base_model = DecisionTreeClassifier(random_state=42)
-            
-        base_model.fit(X_train, y_train)
-        base_preds = base_model.predict(X_test)
-        base_acc = accuracy_score(y_test, base_preds)
-        base_dp = demographic_parity_difference(y_test, base_preds, sensitive_features=A_test)
-
-        mitigator = ThresholdOptimizer(
-            estimator=base_model, 
-            constraints="demographic_parity", 
-            predict_method="predict"
-        )
-        mitigator.fit(X_train, y_train, sensitive_features=A_train)
-        
-        mitigated_preds = mitigator.predict(X_test, sensitive_features=A_test)
-        mit_acc = accuracy_score(y_test, mitigated_preds)
-        mit_dp = demographic_parity_difference(y_test, mitigated_preds, sensitive_features=A_test)
-
-        return {
-            "baseline_model": {
-                "accuracy": round(base_acc, 4),
-                "demographic_parity_difference": round(base_dp, 4),
-                "is_fair": base_dp < 0.1
-            },
-            "mitigated_model": {
-                "accuracy": round(mit_acc, 4),
-                "demographic_parity_difference": round(mit_dp, 4),
-                "is_fair": mit_dp < 0.1
-            },
-            "summary": {
-                "accuracy_change": round(mit_acc - base_acc, 4),
-                "bias_reduction": round(base_dp - mit_dp, 4)
-            }
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# ==========================================
+# CHUNK 4: FAIRNESS ENGINE ENDPOINT
+# ==========================================
 @app.post("/api/v1/fairness-engine")
 async def evaluate_fairness(
     file: UploadFile = File(...),
@@ -271,7 +209,6 @@ async def evaluate_fairness(
     sensitive_attribute: str = Form(...)
 ):
     try:
-        # 1. Load Data
         contents = await file.read()
         if file.filename.endswith('.csv'):
             df = pd.read_csv(io.BytesIO(contents))
@@ -292,29 +229,22 @@ async def evaluate_fairness(
             X, y, A, test_size=0.2, random_state=42, stratify=y
         )
         
-        # 2. Train Standard Model for Evaluation
         model = LogisticRegression(max_iter=1000, random_state=42)
         model.fit(X_train, y_train)
         y_pred = model.predict(X_test)
         
-        # 3. Compute Deep Fairness Metrics
         dpd = demographic_parity_difference(y_test, y_pred, sensitive_features=A_test)
         eod = equalized_odds_difference(y_test, y_pred, sensitive_features=A_test)
         
-        # Handle division by zero for ratio
         try:
             dir_val = demographic_parity_ratio(y_test, y_pred, sensitive_features=A_test)
         except ValueError:
             dir_val = 0.0
 
-        # 4. Compute Fairness Score (0-100)
-        # We penalize the score based on the highest difference metric (DPD or EOD)
-        # A difference of 0 is a perfect 100 score. A difference of 1.0 (max bias) is a 0 score.
         max_disparity = max(dpd, eod)
         raw_score = 100 - (max_disparity * 100)
-        score = max(0, min(100, raw_score)) # Clamp between 0 and 100
+        score = max(0, min(100, raw_score)) 
 
-        # 5. Determine Risk Level
         if score >= 85:
             severity = "Low"
             explanation = "This model demonstrates low levels of bias across the measured groups. It is generally safe for deployment regarding this attribute."
@@ -343,6 +273,174 @@ async def evaluate_fairness(
             "score": round(score, 1),
             "risk_level": severity,
             "human_readable_explanation": explanation
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# CHUNK 6: BIAS MITIGATION ENDPOINT
+# ==========================================
+@app.post("/api/v1/mitigate")
+async def mitigate_bias(
+    file: UploadFile = File(...),
+    target_column: str = Form(...),
+    sensitive_attribute: str = Form(...),
+    model_type: str = Form(...),
+    technique: str = Form(...) 
+):
+    try:
+        contents = await file.read()
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(contents))
+        else:
+            df = pd.read_excel(io.BytesIO(contents))
+            
+        df = df.dropna()
+        
+        A = df[sensitive_attribute]
+        le = LabelEncoder()
+        df[target_column] = le.fit_transform(df[target_column])
+        y = df[target_column]
+        
+        X_base = pd.get_dummies(df.drop(columns=[target_column]))
+        X_tr, X_te, y_tr, y_te, A_tr, A_te = train_test_split(X_base, y, A, test_size=0.2, random_state=42, stratify=y)
+        
+        base_model = get_model(model_type)
+        base_model.fit(X_tr, y_tr)
+        base_preds = base_model.predict(X_te)
+        base_acc = accuracy_score(y_te, base_preds)
+        base_dp = demographic_parity_difference(y_te, base_preds, sensitive_features=A_te)
+
+        mit_acc, mit_dp = 0, 0
+        
+        if technique == 'remove_features':
+            X_mit = pd.get_dummies(df.drop(columns=[target_column, sensitive_attribute]))
+            X_tr_m, X_te_m, y_tr_m, y_te_m, A_tr_m, A_te_m = train_test_split(X_mit, y, A, test_size=0.2, random_state=42, stratify=y)
+            mit_model = get_model(model_type)
+            mit_model.fit(X_tr_m, y_tr_m)
+            m_preds = mit_model.predict(X_te_m)
+            mit_acc = accuracy_score(y_te_m, m_preds)
+            mit_dp = demographic_parity_difference(y_te_m, m_preds, sensitive_features=A_te_m)
+
+        elif technique == 'reweighing':
+            counts = df[sensitive_attribute].value_counts()
+            weights = df[sensitive_attribute].map(lambda x: (len(df)/2) / counts[x])
+            X_tr_m, X_te_m, y_tr_m, y_te_m, W_tr, A_te_m = train_test_split(X_base, y, weights, A, test_size=0.2, random_state=42, stratify=y)
+            mit_model = get_model(model_type)
+            mit_model.fit(X_tr_m, y_tr_m, sample_weight=W_tr)
+            m_preds = mit_model.predict(X_te_m)
+            mit_acc = accuracy_score(y_te_m, m_preds)
+            mit_dp = demographic_parity_difference(y_te_m, m_preds, sensitive_features=A_te_m)
+
+        elif technique == 'threshold_adjustment':
+            mitigator = ThresholdOptimizer(estimator=base_model, constraints="demographic_parity", predict_method="predict")
+            mitigator.fit(X_tr, y_tr, sensitive_features=A_tr)
+            m_preds = mitigator.predict(X_te, sensitive_features=A_te)
+            mit_acc = accuracy_score(y_te, m_preds)
+            mit_dp = demographic_parity_difference(y_te, m_preds, sensitive_features=A_te)
+
+        return {
+            "before": {
+                "accuracy": round(base_acc, 4), 
+                "bias": round(base_dp, 4)
+            },
+            "after": {
+                "accuracy": round(mit_acc, 4), 
+                "bias": round(mit_dp, 4)
+            },
+            "improvement": {
+                "bias_reduced": round(base_dp - mit_dp, 4), 
+                "accuracy_lost": round(base_acc - mit_acc, 4)
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# CHUNK 7: WHAT-IF SIMULATOR ENDPOINT
+# ==========================================
+@app.post("/api/v1/simulate")
+async def simulate_what_if(
+    file: UploadFile = File(...),
+    target_column: str = Form(...),
+    sensitive_attribute: str = Form(...),
+    model_type: str = Form(...),
+    removed_features: str = Form("[]"), 
+    rebalance: bool = Form(False),
+    threshold: float = Form(0.5)
+):
+    try:
+        contents = await file.read()
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(contents))
+        else:
+            df = pd.read_excel(io.BytesIO(contents))
+            
+        df = df.dropna()
+        A = df[sensitive_attribute]
+        le = LabelEncoder()
+        df[target_column] = le.fit_transform(df[target_column])
+        y = df[target_column]
+
+        # --- BASELINE (No modifications) ---
+        X_base = pd.get_dummies(df.drop(columns=[target_column, sensitive_attribute]))
+        X_tr_b, X_te_b, y_tr_b, y_te_b, A_tr_b, A_te_b = train_test_split(X_base, y, A, test_size=0.2, random_state=42, stratify=y)
+        
+        base_model = get_model(model_type)
+        base_model.fit(X_tr_b, y_tr_b)
+        base_preds = base_model.predict(X_te_b)
+        base_dp = demographic_parity_difference(y_te_b, base_preds, sensitive_features=A_te_b)
+        base_score = max(0, min(100, 100 - (base_dp * 100)))
+
+        # --- SIMULATION (Apply user toggles) ---
+        features_to_remove = json.loads(removed_features)
+        drop_list = [target_column, sensitive_attribute] + features_to_remove
+        existing_drops = [col for col in drop_list if col in df.columns]
+        
+        X_sim = pd.get_dummies(df.drop(columns=existing_drops))
+        X_tr_s, X_te_s, y_tr_s, y_te_s, A_tr_s, A_te_s = train_test_split(X_sim, y, A, test_size=0.2, random_state=42, stratify=y)
+
+        sim_model = get_model(model_type)
+        
+        # 1. Apply Dataset Rebalancing
+        if rebalance:
+            counts = A_tr_s.value_counts()
+            weights = A_tr_s.map(lambda x: (len(A_tr_s)/len(counts)) / counts[x])
+            sim_model.fit(X_tr_s, y_tr_s, sample_weight=weights)
+        else:
+            sim_model.fit(X_tr_s, y_tr_s)
+
+        # 2. Apply Custom Decision Threshold
+        # get_model returns classifiers that support predict_proba
+        probs = sim_model.predict_proba(X_te_s)[:, 1] 
+        sim_preds = (probs >= threshold).astype(int)
+
+        sim_acc = accuracy_score(y_te_s, sim_preds)
+        sim_dp = demographic_parity_difference(y_te_s, sim_preds, sensitive_features=A_te_s)
+        sim_score = max(0, min(100, 100 - (sim_dp * 100)))
+
+        # 3. Calculate Impact
+        if base_dp > 0:
+            bias_change_pct = ((base_dp - sim_dp) / base_dp) * 100
+        else:
+            bias_change_pct = 0.0
+
+        return {
+            "baseline": {
+                "score": round(base_score, 1),
+                "bias": round(base_dp, 4)
+            },
+            "simulation": {
+                "score": round(sim_score, 1),
+                "bias": round(sim_dp, 4),
+                "accuracy": round(sim_acc, 4)
+            },
+            "impact": {
+                "bias_change_pct": round(bias_change_pct, 1)
+            }
         }
 
     except Exception as e:
